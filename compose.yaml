@@ -1,0 +1,31 @@
+services:
+  api:
+    build: .
+    command: ["ledger-inbox", "serve", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      LEDGER_INBOX_DATA_DIR: /data
+      LEDGER_INBOX_EMAIL_WEBHOOK_SECRET: ${LEDGER_INBOX_EMAIL_WEBHOOK_SECRET:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ledger-inbox-data:/data
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["ledger-inbox", "worker"]
+    environment:
+      LEDGER_INBOX_DATA_DIR: /data
+      LEDGER_INBOX_RECOGNIZER: ${LEDGER_INBOX_RECOGNIZER:-mock}
+      LEDGER_INBOX_LEDGER_SINK: ${LEDGER_INBOX_LEDGER_SINK:-directory}
+      LEDGER_INBOX_MODEL_BASE_URL: ${LEDGER_INBOX_MODEL_BASE_URL:-http://host.docker.internal:11434/v1}
+      LEDGER_INBOX_MODEL_API_KEY: ${LEDGER_INBOX_MODEL_API_KEY:-local}
+      LEDGER_INBOX_MODEL_NAME: ${LEDGER_INBOX_MODEL_NAME:-qwen3-vl:4b}
+      LEDGER_INBOX_LEDGER_WEBHOOK_URL: ${LEDGER_INBOX_LEDGER_WEBHOOK_URL:-}
+      LEDGER_INBOX_LEDGER_WEBHOOK_SECRET: ${LEDGER_INBOX_LEDGER_WEBHOOK_SECRET:-}
+    volumes:
+      - ledger-inbox-data:/data
+    restart: unless-stopped
+
+volumes:
+  ledger-inbox-data:
