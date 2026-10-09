@@ -1,23 +1,46 @@
 from __future__ import annotations
 
-from typing import Annotated
+import hashlib
+from typing import Annotated, Literal
 
-from fastapi import (
-    Depends,
-    FastAPI,
-    File,
-    Header,
-    HTTPException,
-    Request,
-    UploadFile,
-    status,
-)
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile
+from fastapi.responses import Response
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
+from . import __version__
+from .adapters.ledgers import load_ledger_sink
+from .adapters.recognizers import MockRecognizer
 from .config import Settings
-from .database import Database
+from .database import Database, StateConflict, public_event
 from .image_store import ImageStore
 from .ingestion import IngestionService
+from .limits import UploadLimitMiddleware
+from .review import apply_review, review_contract
 from .security import verify_webhook_signature
+from .worker import Worker
+
+
+class ReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    expected_version: Annotated[StrictInt, Field(ge=1)]
+    action: Literal["approve", "ignore", "retry_recognition"]
+    entry: dict | None = None
+
+
+async def bounded_body(request: Request, limit: int) -> bytes:
+    length = request.headers.get("content-length")
+    if length:
+        try:
+            if int(length) > limit:
+                raise HTTPException(413, "request is too large")
+        except ValueError:
+            raise HTTPException(400, "invalid content length") from None
+    body = bytearray()
+    async for chunk in request.stream():
+        if len(body) + len(chunk) > limit:
+            raise HTTPException(413, "request is too large")
+        body.extend(chunk)
+    return bytes(body)
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -25,81 +48,87 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     database = Database(config.db_path)
     database.initialize()
     ingestion = IngestionService(
-        database, ImageStore(config.data_dir / "images"), config.max_image_bytes
+        database,
+        ImageStore(config.data_dir / "images", config.max_image_pixels),
+        config.max_image_bytes,
+        config.max_email_bytes,
     )
-
     app = FastAPI(
         title="Ledger Inbox",
-        version="0.1.0",
-        description="Multi-channel image ingestion for extensible bookkeeping automation.",
+        version=__version__,
+        description="Multi-channel bookkeeping with durable review and delivery.",
     )
-    app.state.settings = config
-    app.state.database = database
-    app.state.ingestion = ingestion
+    app.add_middleware(UploadLimitMiddleware, max_bytes=config.max_image_bytes + 65536)
+    app.state.settings, app.state.database, app.state.ingestion = (
+        config,
+        database,
+        ingestion,
+    )
+
+    @app.middleware("http")
+    async def private_responses(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
 
     def tenant_from_key(
         x_ledger_inbox_key: Annotated[str | None, Header()] = None,
-    ) -> dict[str, str]:
-        if not x_ledger_inbox_key:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="missing API key"
-            )
-        tenant = database.tenant_for_api_key(x_ledger_inbox_key)
+    ) -> dict:
+        tenant = (
+            database.tenant_for_api_key(x_ledger_inbox_key)
+            if x_ledger_inbox_key
+            else None
+        )
         if tenant is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid API key"
-            )
+            raise HTTPException(401, "missing or invalid API key")
         return tenant
 
-    @app.get("/healthz", tags=["operations"])
-    def health() -> dict[str, str]:
-        return {"status": "ok"}
+    def tenant_event(event_id: str, tenant: dict) -> dict:
+        event = database.get_event(event_id, tenant["id"])
+        if event is None:
+            raise HTTPException(404, "event not found")
+        return event
 
-    @app.post(
-        "/v1/ingest/images", status_code=status.HTTP_202_ACCEPTED, tags=["ingestion"]
-    )
+    @app.get("/healthz", tags=["operations"])
+    def health() -> dict:
+        with database.session() as connection:
+            connection.execute("SELECT 1 FROM ingest_events LIMIT 1")
+        return {"status": "ok", "version": __version__}
+
+    @app.post("/v1/ingest/images", status_code=202, tags=["ingestion"])
     async def ingest_image(
-        image: Annotated[
-            UploadFile, File(description="PNG, JPEG, WebP, HEIC, or AVIF screenshot")
-        ],
-        tenant: dict[str, str] = Depends(tenant_from_key),  # noqa: B008 - FastAPI dependency injection
+        image: Annotated[UploadFile, File()],
+        tenant: dict = Depends(tenant_from_key),
         idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
         x_captured_at: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
+    ) -> dict:
         body = await image.read(config.max_image_bytes + 1)
         try:
-            result = ingestion.ingest_image(
+            return ingestion.ingest_image(
                 tenant_id=tenant["id"],
                 image=body,
                 filename=image.filename or "image",
                 source_kind="https",
                 source_event_id=idempotency_key,
                 captured_at=x_captured_at,
-                metadata={},
-            )
+            ).to_dict()
+        except StateConflict as exc:
+            raise HTTPException(409, str(exc)) from None
         except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
-            ) from exc
-        return result.to_dict()
+            raise HTTPException(422, str(exc)) from None
+        finally:
+            await image.close()
 
-    @app.post(
-        "/v1/inbound/email/rfc822",
-        status_code=status.HTTP_202_ACCEPTED,
-        tags=["ingestion"],
-    )
+    @app.post("/v1/inbound/email/rfc822", status_code=202, tags=["ingestion"])
     async def ingest_rfc822(
         request: Request,
         x_ledger_inbox_recipient: Annotated[str | None, Header()] = None,
         x_ledger_inbox_timestamp: Annotated[str | None, Header()] = None,
         x_ledger_inbox_signature: Annotated[str | None, Header()] = None,
-        x_ledger_inbox_message_id: Annotated[str | None, Header()] = None,
-    ) -> dict[str, object]:
+    ) -> dict:
         if not config.webhook_secret:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="email webhook is disabled",
-            )
+            raise HTTPException(503, "email webhook is disabled")
         if not all(
             (
                 x_ledger_inbox_recipient,
@@ -107,19 +136,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 x_ledger_inbox_signature,
             )
         ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="missing webhook authentication",
-            )
-        body = await request.body()
-        if len(body) > config.max_image_bytes * 4:
-            raise HTTPException(
-                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                detail="email is too large",
-            )
-        assert x_ledger_inbox_recipient is not None
-        assert x_ledger_inbox_timestamp is not None
-        assert x_ledger_inbox_signature is not None
+            raise HTTPException(401, "missing webhook authentication")
+        body = await bounded_body(request, config.max_email_bytes)
         if not verify_webhook_signature(
             config.webhook_secret,
             x_ledger_inbox_timestamp,
@@ -127,40 +145,90 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             body,
             x_ledger_inbox_signature,
         ):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="invalid webhook signature",
-            )
+            raise HTTPException(401, "invalid webhook signature")
         tenant = database.tenant_for_alias(x_ledger_inbox_recipient)
         if tenant is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="unknown inbound alias"
-            )
+            raise HTTPException(404, "unknown inbound alias")
         try:
+            # Only authenticated bytes determine identity; unsigned forwarding headers cannot override it.
             results = ingestion.ingest_email(
                 tenant_id=tenant["id"],
                 raw_message=body,
-                source_event_id=x_ledger_inbox_message_id,
                 recipient=x_ledger_inbox_recipient,
             )
+            return {"events": [result.to_dict() for result in results]}
+        except StateConflict as exc:
+            raise HTTPException(409, str(exc)) from None
         except ValueError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc)
-            ) from exc
-        return {"events": [item.to_dict() for item in results]}
+            raise HTTPException(422, str(exc)) from None
+
+    @app.get("/v1/events", tags=["events"])
+    def list_events(
+        status: str = "needs_review", tenant: dict = Depends(tenant_from_key)
+    ) -> dict:
+        return {"events": database.list_events(tenant["id"], status)}
 
     @app.get("/v1/events/{event_id}", tags=["events"])
-    def get_event(
-        event_id: str,
-        tenant: dict[str, str] = Depends(tenant_from_key),  # noqa: B008 - FastAPI dependency injection
-    ) -> dict[str, object]:
-        event = database.get_event(event_id, tenant["id"])
-        if event is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="event not found"
+    def get_event(event_id: str, tenant: dict = Depends(tenant_from_key)) -> dict:
+        return public_event(tenant_event(event_id, tenant))
+
+    @app.get("/v1/events/{event_id}/image", tags=["review"])
+    def get_image(event_id: str, tenant: dict = Depends(tenant_from_key)) -> Response:
+        from pathlib import Path
+
+        event = tenant_event(event_id, tenant)
+        try:
+            body = Path(event["image_path"]).read_bytes()
+        except OSError:
+            raise HTTPException(409, "original image is unavailable") from None
+        if hashlib.sha256(body).hexdigest() != event["content_sha256"]:
+            raise HTTPException(409, "original image integrity failure")
+        return Response(
+            body,
+            media_type=event["media_type"],
+            headers={"Content-Disposition": "inline"},
+        )
+
+    @app.get("/v1/review/contract", tags=["review"])
+    def get_review_contract(tenant: dict = Depends(tenant_from_key)) -> dict:
+        return review_contract(config)
+
+    @app.post("/v1/events/{event_id}/review", tags=["review"])
+    def review(
+        event_id: str, request: ReviewRequest, tenant: dict = Depends(tenant_from_key)
+    ) -> dict:
+        tenant_event(event_id, tenant)
+        try:
+            apply_review(
+                database,
+                config,
+                event_id,
+                tenant["id"],
+                request.expected_version,
+                request.action,
+                request.entry,
             )
-        event.pop("image_path", None)
-        event.pop("metadata", None)
-        return event
+        except StateConflict as exc:
+            raise HTTPException(409, str(exc)) from None
+        except KeyError:
+            raise HTTPException(404, "event not found") from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        return public_event(tenant_event(event_id, tenant))
+
+    @app.post("/v1/events/{event_id}/reconcile", tags=["review"])
+    def reconcile(event_id: str, tenant: dict = Depends(tenant_from_key)) -> dict:
+        tenant_event(event_id, tenant)
+        worker = Worker(
+            database,
+            MockRecognizer(),
+            load_ledger_sink(config.ledger_sink, config),
+            config,
+        )
+        try:
+            worker.reconcile(event_id, tenant["id"])
+        except StateConflict as exc:
+            raise HTTPException(409, str(exc)) from None
+        return public_event(tenant_event(event_id, tenant))
 
     return app

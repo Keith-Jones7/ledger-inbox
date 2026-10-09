@@ -44,3 +44,16 @@ Successful ingestion returns HTTP `202`:
 
 Resubmitting the same image for the same tenant returns the existing event with
 `duplicate: true`. Clients should reuse a stable `Idempotency-Key` for retries.
+
+The capture timestamp must include a timezone, e.g. `2026-10-09T12:00:00+08:00`.
+It is capture metadata, not proof of payment time. Version 0.2 rejects a reused
+source key with different image bytes (409). Valid images are actually decoded;
+a file extension or a PNG-like header alone is insufficient.
+
+Poll `GET /v1/events/{id}` under the same API key for the final status. `queued`,
+`recognized`, `delivering`, and email/HTTP 202 mean accepted or in progress.
+Only `completed` means the configured sink has supplied its required completion
+proof. `needs_review` and `recognition_failed` have the [review workflow](review.md);
+`delivery_unknown` requires query-only reconciliation. The event API hides storage
+paths and adapter error details. GET `/v1/events/{id}/image` uses identical tenant
+authentication and returns the verified original with no-store caching.

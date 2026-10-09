@@ -2,13 +2,17 @@ FROM python:3.13-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    LEDGER_INBOX_DATA_DIR=/data
+    UV_PYTHON_DOWNLOADS=never \
+    LEDGER_INBOX_DATA_DIR=/data \
+    PATH=/app/.venv/bin:$PATH
 
-RUN useradd --create-home --uid 10001 ledger
+RUN useradd --create-home --uid 10001 ledger \
+    && mkdir -p /data && chown ledger:ledger /data && chmod 700 /data
 WORKDIR /app
-COPY pyproject.toml README.md LICENSE ./
+COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY src ./src
-RUN pip install --no-cache-dir .
+RUN pip install --no-cache-dir uv==0.11.9 \
+    && uv sync --locked --no-dev --no-editable
 
 USER ledger
 VOLUME ["/data"]

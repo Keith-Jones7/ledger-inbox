@@ -10,8 +10,9 @@ from ledger_inbox.api import create_app
 from ledger_inbox.config import Settings
 from ledger_inbox.database import Database
 from ledger_inbox.security import new_api_key, sign_webhook
+from tests.helpers import image_bytes
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"api-image"
+PNG = image_bytes()
 
 
 def make_client(tmp_path: Path) -> tuple[TestClient, Database, str, str]:

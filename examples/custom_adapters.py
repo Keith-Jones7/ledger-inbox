@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ledger_inbox.adapters.ledgers import UnknownDeliveryError
 from ledger_inbox.domain import LedgerEntry, RecognitionContext
 
 
@@ -14,7 +15,7 @@ class ExampleRecognizer:
         return LedgerEntry(
             transaction_type="unknown",
             amount_minor=None,
-            currency="CNY",
+            currency="",
             merchant=None,
             occurred_at=context.captured_at,
             category=None,
@@ -30,5 +31,5 @@ class ExampleLedgerSink:
         self.settings = settings
 
     def deliver(self, entry: LedgerEntry, *, event_id: str, operation_id: str) -> str:
-        # A real integration must persist operation_id at the destination.
-        return f"example:{operation_id}"
+        # Do not claim a write occurred until a real destination confirms it.
+        raise UnknownDeliveryError("example_adapter_has_no_ledger")

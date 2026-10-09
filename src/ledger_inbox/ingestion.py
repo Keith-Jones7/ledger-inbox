@@ -10,6 +10,7 @@ from email.utils import getaddresses
 from typing import Any
 
 from .database import Database
+from .domain import valid_timestamp
 from .image_store import ImageStore
 
 
@@ -29,11 +30,16 @@ class IngestResult:
 
 class IngestionService:
     def __init__(
-        self, database: Database, store: ImageStore, max_image_bytes: int
+        self,
+        database: Database,
+        store: ImageStore,
+        max_image_bytes: int,
+        max_email_bytes: int = 48 * 1024 * 1024,
     ) -> None:
         self.database = database
         self.store = store
         self.max_image_bytes = max_image_bytes
+        self.max_email_bytes = max_email_bytes
 
     def ingest_image(
         self,
@@ -46,6 +52,12 @@ class IngestionService:
         captured_at: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> IngestResult:
+        if captured_at is not None and not valid_timestamp(captured_at):
+            raise ValueError("capture timestamp requires an ISO datetime with timezone")
+        if source_event_id is not None and (
+            not source_event_id.strip() or len(source_event_id) > 512
+        ):
+            raise ValueError("invalid source event ID")
         if not image:
             raise ValueError("image is empty")
         if len(image) > self.max_image_bytes:
@@ -74,12 +86,10 @@ class IngestionService:
         source_event_id: str | None = None,
         recipient: str | None = None,
     ) -> list[IngestResult]:
+        if len(raw_message) > self.max_email_bytes:
+            raise ValueError("email exceeds byte limit")
         message = BytesParser(policy=policy.default).parsebytes(raw_message)
-        message_id = (
-            source_event_id
-            or _message_id(message)
-            or hashlib.sha256(raw_message).hexdigest()
-        )
+        message_id = source_event_id or hashlib.sha256(raw_message).hexdigest()
         results: list[IngestResult] = []
         for index, (filename, payload) in enumerate(_image_attachments(message)):
             results.append(

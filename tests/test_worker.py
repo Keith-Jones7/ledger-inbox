@@ -9,8 +9,9 @@ from ledger_inbox.image_store import ImageStore
 from ledger_inbox.ingestion import IngestionService
 from ledger_inbox.security import new_api_key
 from ledger_inbox.worker import Worker
+from tests.helpers import image_bytes
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"worker-image"
+PNG = image_bytes()
 
 
 class CertainRecognizer:

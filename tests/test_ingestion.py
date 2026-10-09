@@ -7,8 +7,9 @@ from ledger_inbox.database import Database
 from ledger_inbox.image_store import ImageStore
 from ledger_inbox.ingestion import IngestionService
 from ledger_inbox.security import new_api_key
+from tests.helpers import image_bytes
 
-PNG = b"\x89PNG\r\n\x1a\n" + b"test-image"
+PNG = image_bytes()
 
 
 def make_service(tmp_path: Path) -> tuple[Database, IngestionService]:
