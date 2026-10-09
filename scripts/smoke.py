@@ -51,6 +51,22 @@ def wait_event(client, event_id, status):
 
 
 def exercise(url, env):
+    if (
+        env.get("LEDGER_INBOX_RECOGNIZER", "mock") != "mock"
+        or env.get("LEDGER_INBOX_LEDGER_SINK", "directory") != "directory"
+    ):
+        raise ValueError("smoke requires disposable mock/directory services")
+    checkpoint = Path(env["LEDGER_INBOX_DATA_DIR"]) / "smoke-checkpoint.json"
+    if checkpoint.exists():
+        previous = json.loads(checkpoint.read_text())
+        response = httpx.get(
+            url + "/v1/events/" + previous["event_id"],
+            headers={"X-Ledger-Inbox-Key": previous["api_key"]},
+            timeout=10,
+            trust_env=False,
+        )
+        assert response.status_code == 200 and response.json()["status"] == "completed"
+        assert response.json()["delivery"]["id"] == previous["operation_id"]
     tenant = run_cli(["create-tenant", "--name", "synthetic-smoke"], env)
     alias = run_cli(
         [
@@ -139,6 +155,23 @@ def exercise(url, env):
         directory = Path(env["LEDGER_INBOX_DATA_DIR"]) / "ledger-outbox"
         operation = directory / f"{event['delivery']['id']}.json"
         assert json.loads(operation.read_text())["entry"]["amount_minor"] == 1280
+        assert (
+            sum(
+                json.loads(file.read_text())["event_id"] == event_id
+                for file in directory.glob("*.json")
+            )
+            == 1
+        )
+        descriptor = os.open(checkpoint, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w") as output:
+            json.dump(
+                {
+                    "event_id": event_id,
+                    "api_key": tenant["api_key"],
+                    "operation_id": event["delivery"]["id"],
+                },
+                output,
+            )
         # Snapshot is private and readable; full disaster restore is described separately.
         with tempfile.TemporaryDirectory() as backup_root:
             run_cli(

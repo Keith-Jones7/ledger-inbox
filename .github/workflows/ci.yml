@@ -39,6 +39,7 @@ jobs:
       - run: docker compose exec -T api python /tmp/smoke.py --url http://127.0.0.1:8080
       - run: docker compose restart
       - run: docker compose up --wait
+      - run: docker compose cp scripts/smoke.py api:/tmp/smoke.py
       - run: docker compose exec -T api python /tmp/smoke.py --url http://127.0.0.1:8080
       - if: failure()
         run: docker compose logs --no-color
